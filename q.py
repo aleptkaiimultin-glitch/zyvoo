@@ -18,7 +18,7 @@ import telebot
 from telebot import apihelper, types
 
 # ============ КОНФИГ ============
-BOT_TOKEN = "1780288466:LCWJt3cKu1SYbBhj3H4klKGauTWyHSumHgP"
+BOT_TOKEN = "1780288571:6pAksaKOzkq74katMGsvRIJQ2E5LzOvDfw"
 BOT_API_BASE = "https://95-163-153-173.sslip.io"
 ADMIN_ID = 1780285990
 CHANNEL = "@zellenn"
@@ -35,6 +35,19 @@ DB = "bot.db"
 _lock = threading.Lock()
 _db = sqlite3.connect(DB, check_same_thread=False)
 _db.row_factory = sqlite3.Row
+
+# ---- q() и x() объявлены ДО любого использования ----
+def q(sql, a=(), one=False):
+    with _lock:
+        r = _db.execute(sql, a).fetchall()
+    return (r[0] if r else None) if one else r
+
+def x(sql, a=()):
+    with _lock:
+        _db.execute(sql, a)
+        _db.commit()
+# ----------------------------------------------------
+
 _db.executescript("""
 CREATE TABLE IF NOT EXISTS payouts(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,18 +64,9 @@ CREATE TABLE IF NOT EXISTS banned(user_id INTEGER PRIMARY KEY, ts INTEGER);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """)
 _db.commit()
+
 if not q("SELECT value FROM settings WHERE key='notify'", one=True):
     x("INSERT INTO settings(key,value) VALUES('notify','1')")
-
-def q(sql, a=(), one=False):
-    with _lock:
-        r = _db.execute(sql, a).fetchall()
-    return (r[0] if r else None) if one else r
-
-def x(sql, a=()):
-    with _lock:
-        _db.execute(sql, a)
-        _db.commit()
 
 def gen_code():
     chars = string.ascii_uppercase + string.digits
@@ -73,11 +77,10 @@ def gen_code():
     return f"P-{int(time.time())}"
 
 def calc_reward(ads):
-    if ads < 5: return "1 мишка 🧸"
-    elif ads < 10: return "2 мишки 🧸🧸"
-    elif ads < 20: return "3 мишки 🧸🧸🧸"
-    elif ads < 50: return "1 NFT 🖼"
-    elif ads < 100: return "2–3 NFT 🖼🖼"
+    if ads <= 2: return "1 мишка 🧸"
+    elif ads <= 5: return "2 мишки 🧸🧸"
+    elif ads <= 10: return "5 мишек 🧸🧸🧸🧸🧸"
+    elif ads <= 20: return "1 NFT 🖼"
     else: return f"Договор с {NEGOTIATOR} 💬"
 
 def notify_on():
@@ -237,12 +240,12 @@ def h_start(m):
     bot.send_message(m.chat.id,
         f"👋 Привет! Это бот выплат за рекламу канала {CHANNEL}.\n\n"
         "🎁 *Награды:*\n"
-        "• 0–5 реклам → 1 мишка 🧸\n"
-        "• 5–10 → 2 мишки 🧸🧸\n"
-        "• 10–20 → 3 мишки 🧸🧸🧸\n"
-        "• 20–50 → 1 NFT 🖼\n"
-        "• 50–100 → 2–3 NFT 🖼🖼\n"
-        f"• 100+ → договор с {NEGOTIATOR}\n\n"
+        "• 1–2 рекламы → 1 мишка 🧸\n"
+        "• 2–5 → 2 мишки 🧸🧸\n"
+        "• 5–10 → 5 мишек 🧸🧸🧸🧸🧸\n"
+        "• 10–20 → 1 NFT 🖼\n"
+        f"• больше 20 → договор с {NEGOTIATOR}\n\n"
+        f"📸 Если скриншотов больше 10 — напиши в ЛС {NEGOTIATOR}\n\n"
         "Жми «Подать заявку» — укажи username, количество реклам и пришли скриншоты.",
         parse_mode="Markdown", reply_markup=main_kb())
 
@@ -330,10 +333,18 @@ def h_photo(m):
     photo_id = m.photo[-1].file_id
     st["data"]["photos"].append(photo_id)
     count = len(st["data"]["photos"])
-    if count >= MAX_PHOTOS:
+    if count > MAX_PHOTOS:
         return bot.send_message(m.chat.id,
-            f"📸 Достигнут лимит ({MAX_PHOTOS}). Нажми «Отправить заявку».",
-            reply_markup=photos_done_kb())
+            f"📸 У тебя уже больше {MAX_PHOTOS} скриншотов.\n\n"
+            f"Такие объёмы разбираем вручную — напиши в ЛС {NEGOTIATOR}, "
+            f"скинь все скрины туда, и мы всё оформим.",
+            parse_mode="Markdown", reply_markup=photos_done_kb())
+    if count == MAX_PHOTOS:
+        return bot.send_message(m.chat.id,
+            f"📸 Фото {count}/{MAX_PHOTOS} — достигнут лимит.\n"
+            f"Нажми «Отправить заявку» или, если скринов больше, "
+            f"напиши в ЛС {NEGOTIATOR}.",
+            parse_mode="Markdown", reply_markup=photos_done_kb())
     bot.send_message(m.chat.id,
         f"📸 Фото {count}/{MAX_PHOTOS} принято.\n"
         f"Пришли ещё или нажми «Отправить заявку».",
