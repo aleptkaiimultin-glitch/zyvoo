@@ -18,7 +18,7 @@ import telebot
 from telebot import apihelper, types
 
 # ============ КОНФИГ ============
-BOT_TOKEN = "1780288571:6pAksaKOzkq74katMGsvRIJQ2E5LzOvDfw"
+BOT_TOKEN = "1780288571:wwwDHj5JBYtarcgsuR9ZyTV-tJ0VOEoCq_u"
 BOT_API_BASE = "https://95-163-153-173.sslip.io"
 ADMIN_ID = 1780285990
 CHANNEL = "@zellenn"
