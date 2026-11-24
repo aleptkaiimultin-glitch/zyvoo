@@ -1,754 +1,1488 @@
-import os, csv, time, sqlite3, threading, random, string
-
-# ====== Игнорируем системный прокси ======
-os.environ["NO_PROXY"] = "*"
-os.environ["no_proxy"] = "*"
-for _v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-           "ALL_PROXY", "all_proxy"):
-    os.environ.pop(_v, None)
-import requests
-_orig_request = requests.Session.request
-def _no_proxy_request(self, *a, **kw):
-    kw["proxies"] = {"http": None, "https": None}
-    return _orig_request(self, *a, **kw)
-requests.Session.request = _no_proxy_request
-# =========================================
+import os
+import csv
+import time
+import sqlite3
+import threading
+import random
+import string
 
 import telebot
-from telebot import apihelper, types
+from telebot import types
 
-# ============ КОНФИГ ============
+# =========================================================
+# CONFIGURATION
+# =========================================================
+# Set BOT_TOKEN as an environment variable before starting.
 BOT_TOKEN = "1780288571:wwwDHj5JBYtarcgsuR9ZyTV-tJ0VOEoCq_u"
-BOT_API_BASE = "https://95-163-153-173.sslip.io"
 ADMIN_ID = 1780285990
 CHANNEL = "@zellenn"
 NEGOTIATOR = "@monk888"
 COOLDOWN = 30
 MAX_PHOTOS = 10
-
-apihelper.API_URL = BOT_API_BASE + "/bot{0}/{1}"
-apihelper.FILE_URL = BOT_API_BASE + "/file/bot{0}/{1}"
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
-
-# ============ БАЗА ============
 DB = "bot.db"
-_lock = threading.Lock()
-_db = sqlite3.connect(DB, check_same_thread=False)
-_db.row_factory = sqlite3.Row
 
-# ---- q() и x() объявлены ДО любого использования ----
-def q(sql, a=(), one=False):
-    with _lock:
-        r = _db.execute(sql, a).fetchall()
-    return (r[0] if r else None) if one else r
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN is not set. Set the new token from @BotFather "
+        "in the BOT_TOKEN environment variable."
+    )
 
-def x(sql, a=()):
-    with _lock:
-        _db.execute(sql, a)
-        _db.commit()
-# ----------------------------------------------------
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+db_lock = threading.RLock()
+db = sqlite3.connect(DB, check_same_thread=False)
+db.row_factory = sqlite3.Row
 
-_db.executescript("""
-CREATE TABLE IF NOT EXISTS payouts(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE, user_id INTEGER, chat_id INTEGER, username TEXT,
-    target TEXT, ads_count INTEGER DEFAULT 0, reward TEXT,
-    photos TEXT DEFAULT '', status TEXT DEFAULT 'new',
-    hidden INTEGER DEFAULT 0, created INTEGER);
-CREATE TABLE IF NOT EXISTS questions(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE, user_id INTEGER, chat_id INTEGER, username TEXT,
-    text TEXT, answer TEXT DEFAULT '', status TEXT DEFAULT 'new',
-    hidden INTEGER DEFAULT 0, created INTEGER);
-CREATE TABLE IF NOT EXISTS banned(user_id INTEGER PRIMARY KEY, ts INTEGER);
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-""")
-_db.commit()
+# =========================================================
+# DATABASE
+# =========================================================
+with db_lock:
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS payouts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE,
+        user_id INTEGER,
+        chat_id INTEGER,
+        username TEXT,
+        target TEXT,
+        ads_count INTEGER DEFAULT 0,
+        reward TEXT,
+        photos TEXT DEFAULT '',
+        status TEXT DEFAULT 'new',
+        hidden INTEGER DEFAULT 0,
+        created INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS questions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE,
+        user_id INTEGER,
+        chat_id INTEGER,
+        username TEXT,
+        text TEXT,
+        answer TEXT DEFAULT '',
+        status TEXT DEFAULT 'new',
+        hidden INTEGER DEFAULT 0,
+        created INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS banned(
+        user_id INTEGER PRIMARY KEY,
+        ts INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+    """)
+    db.commit()
+
+
+def q(sql, args=(), one=False):
+    with db_lock:
+        cur = db.execute(sql, args)
+        rows = cur.fetchall()
+    return (rows[0] if rows else None) if one else rows
+
+
+def x(sql, args=()):
+    with db_lock:
+        db.execute(sql, args)
+        db.commit()
+
 
 if not q("SELECT value FROM settings WHERE key='notify'", one=True):
-    x("INSERT INTO settings(key,value) VALUES('notify','1')")
+    x("INSERT OR IGNORE INTO settings(key,value) VALUES('notify','1')")
 
-def gen_code():
-    chars = string.ascii_uppercase + string.digits
-    for _ in range(50):
-        code = f"P-{''.join(random.choices(chars, k=4))}"
-        if not q("SELECT 1 FROM payouts WHERE code=?", (code,), one=True):
-            return code
-    return f"P-{int(time.time())}"
 
-def calc_reward(ads):
-    if ads <= 2: return "1 мишка 🧸"
-    elif ads <= 5: return "2 мишки 🧸🧸"
-    elif ads <= 10: return "5 мишек 🧸🧸🧸🧸🧸"
-    elif ads <= 20: return "1 NFT 🖼"
-    else: return f"Договор с {NEGOTIATOR} 💬"
-
-def notify_on():
-    r = q("SELECT value FROM settings WHERE key='notify'", one=True)
-    return r and r["value"] == "1"
-
-STATUS = {"new":"🆕 Новая","in_work":"🔧 В работе","paid":"✅ Выплачено",
-          "rejected":"❌ Отклонена","closed":"🔒 Закрыта"}
-QSTATUS = {"new":"🆕 Без ответа","answered":"✅ Отвечен","closed":"🔒 Закрыт"}
+# =========================================================
+# CONSTANTS / HELPERS
+# =========================================================
+STATUS = {
+    "new": "🆕 Новая",
+    "in_work": "🔧 В работе",
+    "paid": "✅ Выплачено",
+    "rejected": "❌ Отклонена",
+    "closed": "🔒 Закрыта",
+}
+QSTATUS = {
+    "new": "🆕 Без ответа",
+    "answered": "✅ Отвечен",
+    "closed": "🔒 Закрыт",
+}
 
 states = {}
 cooldown = {}
 
-# ============ КЛАВИАТУРЫ ============
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+def is_banned(user_id):
+    return q(
+        "SELECT user_id FROM banned WHERE user_id=?",
+        (user_id,),
+        one=True
+    ) is not None
+
+
+def notify_on():
+    row = q(
+        "SELECT value FROM settings WHERE key='notify'",
+        one=True
+    )
+    return bool(row and row["value"] == "1")
+
+
+def gen_code(prefix="P"):
+    chars = string.ascii_uppercase + string.digits
+    table = "payouts" if prefix == "P" else "questions"
+    for _ in range(100):
+        code = f"{prefix}-" + "".join(
+            random.choices(chars, k=4)
+        )
+        if not q(f"SELECT 1 FROM {table} WHERE code=?", (code,), one=True):
+            return code
+    return f"{prefix}-{int(time.time())}"
+
+
+def calc_reward(ads):
+    if ads <= 2:
+        return "1 мишка 🧸"
+    if ads <= 5:
+        return "2 мишки 🧸🧸"
+    if ads <= 10:
+        return "5 мишек 🧸🧸🧸🧸🧸"
+    if ads <= 20:
+        return "1 NFT 🖼"
+    return f"Договор с {NEGOTIATOR} 💬"
+
+
+def fmt_payout(t):
+    photos = t["photos"] or ""
+    count = len([p for p in photos.split(",") if p])
+    created = time.strftime(
+        "%d.%m.%Y %H:%M",
+        time.localtime(t["created"] or time.time())
+    )
+    return (
+        f"💰 Заявка {t['code']}\n"
+        f"Статус: {STATUS.get(t['status'], t['status'])}\n\n"
+        f"👤 Пользователь: @{t['username'] or '—'}\n"
+        f"🆔 ID: {t['user_id']}\n"
+        f"📢 Аккаунт/канал для выплаты: {t['target']}\n"
+        f"📊 Количество реклам: {t['ads_count']}\n"
+        f"🎁 Награда: {t['reward']}\n"
+        f"📸 Скриншотов: {count}\n\n"
+        f"🕐 Создана: {created}"
+    )
+
+
+def fmt_user_payout(t):
+    created = time.strftime(
+        "%d.%m.%Y %H:%M",
+        time.localtime(t["created"] or time.time())
+    )
+    return (
+        f"💰 Заявка {t['code']}\n"
+        f"Статус: {STATUS.get(t['status'], t['status'])}\n\n"
+        f"📢 Аккаунт/канал: {t['target']}\n"
+        f"📊 Реклам: {t['ads_count']}\n"
+        f"🎁 Награда: {t['reward']}\n"
+        f"🕐 Создана: {created}"
+    )
+
+
+def fmt_question(r):
+    answer = f"\n\n✅ Ответ администрации:\n{r['answer']}" if r["answer"] else ""
+    return (
+        f"💬 Вопрос {r['code']}\n"
+        f"Статус: {QSTATUS.get(r['status'], r['status'])}\n\n"
+        f"👤 @{r['username'] or '—'} (ID: {r['user_id']})\n"
+        f"📝 {r['text']}{answer}"
+    )
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
 def main_kb():
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("💰 Подать заявку на выплату", callback_data="p:new"))
-    kb.add(types.InlineKeyboardButton("💬 Задать вопрос", callback_data="q:new"))
-    kb.add(types.InlineKeyboardButton("📋 Мои заявки", callback_data="my:payouts"))
-    kb.add(types.InlineKeyboardButton("📨 Мои вопросы", callback_data="my:questions"))
+    kb.add(
+        types.InlineKeyboardButton(
+            "💰 Подать заявку на выплату",
+            callback_data="p:new"
+        ),
+        types.InlineKeyboardButton(
+            "💬 Задать вопрос",
+            callback_data="q:new"
+        ),
+        types.InlineKeyboardButton(
+            "📋 Мои заявки",
+            callback_data="my:payouts"
+        ),
+        types.InlineKeyboardButton(
+            "📨 Мои вопросы",
+            callback_data="my:questions"
+        )
+    )
     return kb
+
 
 def cancel_kb():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data="cancel"))
     return kb
 
+
 def photos_done_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("✅ Отправить заявку", callback_data="photos_done"))
-    kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data="cancel"))
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "✅ Отправить заявку",
+            callback_data="photos_done"
+        ),
+        types.InlineKeyboardButton(
+            "❌ Отменить",
+            callback_data="cancel"
+        )
+    )
     return kb
+
 
 def admin_menu_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("📂 Открытые", callback_data="adm:open"),
-           types.InlineKeyboardButton("🔒 Закрытые", callback_data="adm:closed"))
-    kb.add(types.InlineKeyboardButton("📋 Все заявки", callback_data="adm:all"),
-           types.InlineKeyboardButton("💬 Вопросы", callback_data="adm:questions"))
-    kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"),
-           types.InlineKeyboardButton("🚫 Баны", callback_data="adm:bans"))
-    notify_label = "🔔 Уведомления: ВКЛ" if notify_on() else "🔕 Уведомления: ВЫКЛ"
-    kb.add(types.InlineKeyboardButton(notify_label, callback_data="adm:notify"))
-    kb.add(types.InlineKeyboardButton("📢 Рассылка", callback_data="adm:bc"),
-           types.InlineKeyboardButton("📤 CSV", callback_data="adm:csv"))
+    kb.add(
+        types.InlineKeyboardButton("📂 Открытые", callback_data="adm:open"),
+        types.InlineKeyboardButton("🔒 Закрытые", callback_data="adm:closed")
+    )
+    kb.add(
+        types.InlineKeyboardButton("📋 Все заявки", callback_data="adm:all"),
+        types.InlineKeyboardButton("💬 Вопросы", callback_data="adm:questions")
+    )
+    kb.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"),
+        types.InlineKeyboardButton("🚫 Баны", callback_data="adm:bans")
+    )
+    label = "🔔 Уведомления: ВКЛ" if notify_on() else "🔕 Уведомления: ВЫКЛ"
+    kb.add(types.InlineKeyboardButton(label, callback_data="adm:notify"))
+    kb.add(
+        types.InlineKeyboardButton("📢 Рассылка", callback_data="adm:bc"),
+        types.InlineKeyboardButton("📤 CSV", callback_data="adm:csv")
+    )
     return kb
 
-def payout_list_kb(rows):
+
+def payout_list_kb(rows, back="adm:menu"):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for r in rows:
-        label = f"{r['code']} {STATUS.get(r['status'],'')} — {r['reward']}"
-        kb.add(types.InlineKeyboardButton(label[:60], callback_data=f"pv:{r['code']}"))
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
-    return kb
-
-def closed_list_kb(rows):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for r in rows:
-        label = f"🔒 {r['code']} — {r['reward']}"
-        kb.add(types.InlineKeyboardButton(label[:60], callback_data=f"rc:{r['code']}"))
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
-    return kb
-
-def profile_btn(username):
-    uname = (username or "").lstrip("@").strip()
-    if uname and all(c.isalnum() or c == "_" for c in uname):
-        return types.InlineKeyboardButton(
-            f"👤 Профиль @{uname}",
-            url=f"https://t.me/{uname}"
+        label = (
+            f"{r['code']} {STATUS.get(r['status'], '')} — "
+            f"{r['reward'] or 'без награды'}"
         )
-    return None
-
-def payout_card_kb(code, username="", is_closed=False):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    if is_closed:
-        kb.add(types.InlineKeyboardButton("🔓 Открыть заново", callback_data=f"rc:{code}"))
-        kb.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"td:{code}"))
-        pb = profile_btn(username)
-        if pb: kb.add(pb)
-        kb.add(types.InlineKeyboardButton("⬅️ К списку", callback_data="adm:closed"))
-        return kb
-    kb.add(types.InlineKeyboardButton("✅ Принять", callback_data=f"pa:{code}"),
-           types.InlineKeyboardButton("❌ Отклонить", callback_data=f"pd:{code}"))
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:open"))
-    pb = profile_btn(username)
-    if pb: kb.add(pb)
+        kb.add(
+            types.InlineKeyboardButton(
+                label[:60],
+                callback_data=f"pv:{r['code']}"
+            )
+        )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=back))
     return kb
 
-def user_payout_kb(code):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🔒 Закрыть заявку", callback_data=f"upc:{code}"))
-    kb.add(types.InlineKeyboardButton("👁 Убрать из списка", callback_data=f"uph:{code}"))
-    return kb
-
-def user_my_list_kb(rows):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for r in rows:
-        label = f"{r['code']} {STATUS.get(r['status'],'')} — {r['reward']}"
-        kb.add(types.InlineKeyboardButton(label[:60], callback_data=f"upv:{r['code']}"))
-    return kb
 
 def question_list_kb(rows):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for r in rows:
-        label = f"{r['code']} {QSTATUS.get(r['status'],'')} — @{r['username'] or '—'}"
-        kb.add(types.InlineKeyboardButton(label[:60], callback_data=f"qv:{r['code']}"))
+        label = f"{r['code']} {QSTATUS.get(r['status'], '')} — @{r['username'] or '—'}"
+        kb.add(
+            types.InlineKeyboardButton(
+                label[:60],
+                callback_data=f"qv:{r['code']}"
+            )
+        )
     kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
     return kb
 
+
+def payout_card_kb(code, is_closed=False):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    if is_closed:
+        kb.add(
+            types.InlineKeyboardButton(
+                "🔓 Открыть заново",
+                callback_data=f"rc:{code}"
+            )
+        )
+    else:
+        kb.add(
+            types.InlineKeyboardButton(
+                "✅ Принять",
+                callback_data=f"pa:{code}"
+            ),
+            types.InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"pd:{code}"
+            )
+        )
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ Вернуться к списку",
+            callback_data="adm:open"
+        )
+    )
+    return kb
+
+
+def user_payout_kb(code):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔒 Закрыть заявку",
+            callback_data=f"upc:{code}"
+        ),
+        types.InlineKeyboardButton(
+            "👁 Убрать из списка",
+            callback_data=f"uph:{code}"
+        )
+    )
+    return kb
+
+
 def question_card_kb(code):
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("💬 Ответить", callback_data=f"qr:{code}"),
-           types.InlineKeyboardButton("🔒 Закрыть", callback_data=f"qc:{code}"))
+    kb.add(
+        types.InlineKeyboardButton("💬 Ответить", callback_data=f"qr:{code}"),
+        types.InlineKeyboardButton("🔒 Закрыть", callback_data=f"qc:{code}")
+    )
     kb.add(types.InlineKeyboardButton("⬅️ К списку", callback_data="adm:questions"))
     return kb
 
-# ============ ФОРМАТ ============
-def fmt_payout(t):
-    photos = t["photos"] or ""
-    count = len(photos.split(",")) if photos else 0
-    return (f"💰 *Заявка {t['code']}*\n"
-            f"Статус: {STATUS.get(t['status'], t['status'])}\n\n"
-            f"👤 @{t['username'] or '—'} (`{t['user_id']}`)\n"
-            f"📢 Канал: {t['target']}\n"
-            f"📊 Реклам: {t['ads_count']}\n"
-            f"🎁 Награда: {t['reward']}\n"
-            f"📸 Скриншотов: {count}\n\n"
-            f"🕐 {time.strftime('%d.%m %H:%M', time.localtime(t['created']))}")
 
-def fmt_user_payout(t):
-    return (f"💰 *Заявка {t['code']}*\n"
-            f"Статус: {STATUS.get(t['status'], t['status'])}\n\n"
-            f"📢 Канал: {t['target']}\n"
-            f"📊 Реклам: {t['ads_count']}\n"
-            f"🎁 Награда: {t['reward']}\n\n"
-            f"🕐 {time.strftime('%d.%m %H:%M', time.localtime(t['created']))}")
+# =========================================================
+# MESSAGE SENDING
+# =========================================================
+def send_admin_payout(chat_id, payout):
+    """Send screenshots as an album, then send the action card."""
+    photo_ids = [
+        item for item in (payout["photos"] or "").split(",") if item
+    ]
 
-def fmt_question(r):
-    ans = f"\n\n✅ *Ответ:* {r['answer']}" if r["answer"] else ""
-    return (f"💬 *Вопрос {r['code']}*\n"
-            f"Статус: {QSTATUS.get(r['status'], r['status'])}\n\n"
-            f"👤 @{r['username'] or '—'} (`{r['user_id']}`)\n\n"
-            f"📝 {r['text']}{ans}\n\n"
-            f"🕐 {time.strftime('%d.%m %H:%M', time.localtime(r['created']))}")
+    if photo_ids:
+        try:
+            media = [
+                types.InputMediaPhoto(file_id)
+                for file_id in photo_ids[:MAX_PHOTOS]
+            ]
+            bot.send_media_group(chat_id, media)
+        except Exception as exc:
+            print("[PHOTO ALBUM ERROR]", exc)
+            # Fallback: send photos individually if album sending fails.
+            for file_id in photo_ids[:MAX_PHOTOS]:
+                try:
+                    bot.send_photo(chat_id, file_id)
+                except Exception as photo_exc:
+                    print("[PHOTO ERROR]", photo_exc)
 
-def is_banned(uid):
-    return q("SELECT user_id FROM banned WHERE user_id=?", (uid,), one=True) is not None
+    bot.send_message(
+        chat_id,
+        fmt_payout(payout),
+        reply_markup=payout_card_kb(
+            payout["code"],
+            payout["status"] == "closed"
+        )
+    )
 
-# ============ КОМАНДЫ ============
+
+def safe_notify_user(chat_id, text):
+    try:
+        bot.send_message(chat_id, text)
+        return True
+    except Exception as exc:
+        print("[USER NOTIFICATION ERROR]", exc)
+        return False
+
+
+# =========================================================
+# COMMANDS
+# =========================================================
 @bot.message_handler(commands=["start"])
-def h_start(m):
-    if m.from_user.id == ADMIN_ID:
-        return bot.send_message(m.chat.id, "👑 Админ. /menu — панель.",
-                                reply_markup=admin_menu_kb())
-    if is_banned(m.from_user.id):
-        return bot.send_message(m.chat.id, "🚫 Забанен.")
-    bot.send_message(m.chat.id,
-        f"👋 Привет! Это бот выплат за рекламу канала {CHANNEL}.\n\n"
-        "🎁 *Награды:*\n"
+def h_start(message):
+    uid = message.from_user.id
+
+    if is_admin(uid):
+        bot.send_message(
+            message.chat.id,
+            "👑 Админ-панель. Используй /menu.",
+            reply_markup=admin_menu_kb()
+        )
+        return
+
+    if is_banned(uid):
+        bot.send_message(message.chat.id, "🚫 Доступ к боту ограничен.")
+        return
+
+    bot.send_message(
+        message.chat.id,
+        f"👋 Привет! Это бот заявок на выплаты за рекламу канала {CHANNEL}.\n\n"
+        "🎁 Система наград:\n"
         "• 1–2 рекламы → 1 мишка 🧸\n"
-        "• 2–5 → 2 мишки 🧸🧸\n"
-        "• 5–10 → 5 мишек 🧸🧸🧸🧸🧸\n"
-        "• 10–20 → 1 NFT 🖼\n"
-        f"• больше 20 → договор с {NEGOTIATOR}\n\n"
-        f"📸 Если скриншотов больше 10 — напиши в ЛС {NEGOTIATOR}\n\n"
-        "Жми «Подать заявку» — укажи username, количество реклам и пришли скриншоты.",
-        parse_mode="Markdown", reply_markup=main_kb())
+        "• 3–5 реклам → 2 мишки 🧸🧸\n"
+        "• 6–10 реклам → 5 мишек 🧸🧸🧸🧸🧸\n"
+        "• 11–20 реклам → 1 NFT 🖼\n"
+        f"• Более 20 реклам → обсуждение с {NEGOTIATOR}\n\n"
+        f"📸 Максимум в одной заявке: {MAX_PHOTOS} скриншотов.\n\n"
+        "Нажми «Подать заявку», укажи аккаунт и количество реклам, "
+        "затем отправь скриншоты. После отправки заявка поступит "
+        "администратору на проверку.",
+        reply_markup=main_kb()
+    )
+
 
 @bot.message_handler(commands=["id"])
-def h_id(m): bot.reply_to(m, f"`{m.from_user.id}`", parse_mode="Markdown")
+def h_id(message):
+    bot.reply_to(message, f"Твой Telegram ID: {message.from_user.id}")
+
 
 @bot.message_handler(commands=["menu"])
-def h_menu(m):
-    if m.from_user.id != ADMIN_ID: return
-    bot.send_message(m.chat.id, "🛠 Админ-меню:", reply_markup=admin_menu_kb())
+def h_menu(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.send_message(
+        message.chat.id,
+        "🛠 Админ-панель:",
+        reply_markup=admin_menu_kb()
+    )
+
 
 @bot.message_handler(commands=["cancel"])
-def h_cancel(m):
-    if m.from_user.id in states:
-        del states[m.from_user.id]
-        return bot.send_message(m.chat.id, "Отменено.", reply_markup=main_kb())
-    bot.send_message(m.chat.id, "Нечего отменять.")
+def h_cancel(message):
+    if message.from_user.id in states:
+        states.pop(message.from_user.id, None)
+        bot.send_message(
+            message.chat.id,
+            "❌ Действие отменено.",
+            reply_markup=main_kb()
+        )
+    else:
+        bot.send_message(message.chat.id, "Сейчас нечего отменять.")
+
 
 @bot.message_handler(commands=["notify"])
-def h_notify(m):
-    if m.from_user.id != ADMIN_ID: return
-    parts = (m.text or "").split()
+def h_notify(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split()
     if len(parts) < 2:
-        cur = "ВКЛ" if notify_on() else "ВЫКЛ"
-        return bot.send_message(m.chat.id, f"Сейчас: {cur}\n`/notify on` или `/notify off`",
-                                parse_mode="Markdown")
-    val = parts[1].lower()
-    if val == "on":
-        x("UPDATE settings SET value='1' WHERE key='notify'")
-        bot.send_message(m.chat.id, "🔔 Уведомления включены.")
-    elif val == "off":
-        x("UPDATE settings SET value='0' WHERE key='notify'")
-        bot.send_message(m.chat.id, "🔕 Уведомления выключены.")
-    else:
-        bot.send_message(m.chat.id, "Использование: `/notify on` или `/notify off`",
-                         parse_mode="Markdown")
+        current = "ВКЛ" if notify_on() else "ВЫКЛ"
+        bot.send_message(
+            message.chat.id,
+            f"Уведомления сейчас: {current}\n"
+            "/notify on — включить\n"
+            "/notify off — выключить"
+        )
+        return
+
+    value = parts[1].lower()
+    if value not in ("on", "off"):
+        bot.send_message(message.chat.id, "Использование: /notify on или /notify off")
+        return
+
+    new_value = "1" if value == "on" else "0"
+    x(
+        "INSERT INTO settings(key,value) VALUES('notify',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (new_value,)
+    )
+    bot.send_message(
+        message.chat.id,
+        "🔔 Уведомления включены." if new_value == "1"
+        else "🔕 Уведомления выключены.",
+        reply_markup=admin_menu_kb()
+    )
+
 
 @bot.message_handler(commands=["status"])
-def h_status(m):
-    parts = (m.text or "").split(maxsplit=1)
+def h_status(message):
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        return bot.send_message(m.chat.id, "Использование: `/status КОД`\nПример: `/status P-ABCD`",
-                                parse_mode="Markdown")
-    code = parts[1].strip().upper()
-    t = q("SELECT * FROM payouts WHERE code=? AND user_id=?", (code, m.from_user.id), one=True)
-    if not t:
-        return bot.send_message(m.chat.id, f"Заявка `{code}` не найдена.", parse_mode="Markdown")
-    bot.send_message(m.chat.id, fmt_user_payout(t), parse_mode="Markdown")
+        bot.reply_to(message, "Использование: /status P-ABCD")
+        return
 
-# ============ СТАРТ ЗАЯВКИ ============
+    code = parts[1].strip().upper()
+    payout = q(
+        "SELECT * FROM payouts WHERE code=? AND user_id=?",
+        (code, message.from_user.id),
+        one=True
+    )
+    if not payout:
+        bot.reply_to(message, f"Заявка {code} не найдена.")
+        return
+
+    bot.send_message(
+        message.chat.id,
+        fmt_user_payout(payout),
+        reply_markup=user_payout_kb(code)
+    )
+
+
+@bot.message_handler(commands=["ban"])
+def h_ban(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        bot.reply_to(message, "Использование: /ban TELEGRAM_ID")
+        return
+    uid = int(parts[1])
+    x(
+        "INSERT OR REPLACE INTO banned(user_id,ts) VALUES(?,?)",
+        (uid, int(time.time()))
+    )
+    bot.reply_to(message, f"🚫 Пользователь {uid} заблокирован.")
+
+
+@bot.message_handler(commands=["unban"])
+def h_unban_command(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        bot.reply_to(message, "Использование: /unban TELEGRAM_ID")
+        return
+    uid = int(parts[1])
+    x("DELETE FROM banned WHERE user_id=?", (uid,))
+    bot.reply_to(message, f"✅ Пользователь {uid} разблокирован.")
+
+
+# =========================================================
+# START NEW PAYOUT / QUESTION
+# =========================================================
 @bot.callback_query_handler(func=lambda c: c.data == "p:new")
-def cb_new_payout(c):
-    bot.answer_callback_query(c.id)
-    uid = c.from_user.id
-    if is_banned(uid): return bot.send_message(c.message.chat.id, "🚫 Забанен.")
-    if int(time.time()) - cooldown.get(uid, 0) < COOLDOWN:
-        return bot.send_message(c.message.chat.id, "⏳ Подожди.")
-    states[uid] = {"kind": "payout", "step": 0, "data": {"photos": []}}
-    bot.send_message(c.message.chat.id,
-        "1️⃣ Напиши свой `@username`, на который оформить выплату:",
-        parse_mode="Markdown", reply_markup=cancel_kb())
+def cb_new_payout(call):
+    bot.answer_callback_query(call.id)
+    uid = call.from_user.id
+
+    if is_banned(uid):
+        bot.send_message(call.message.chat.id, "🚫 Доступ к боту ограничен.")
+        return
+
+    now = int(time.time())
+    if now - cooldown.get(uid, 0) < COOLDOWN:
+        remaining = COOLDOWN - (now - cooldown.get(uid, 0))
+        bot.send_message(
+            call.message.chat.id,
+            f"⏳ Подожди ещё {remaining} сек. перед новой заявкой."
+        )
+        return
+
+    states[uid] = {
+        "kind": "payout",
+        "step": 0,
+        "data": {"photos": []}
+    }
+    bot.send_message(
+        call.message.chat.id,
+        "1️⃣ Напиши @username аккаунта/канала, на который оформить выплату:",
+        reply_markup=cancel_kb()
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data == "q:new")
-def cb_new_question(c):
-    bot.answer_callback_query(c.id)
-    uid = c.from_user.id
-    if is_banned(uid): return bot.send_message(c.message.chat.id, "🚫 Забанен.")
+def cb_new_question(call):
+    bot.answer_callback_query(call.id)
+    uid = call.from_user.id
+
+    if is_banned(uid):
+        bot.send_message(call.message.chat.id, "🚫 Доступ к боту ограничен.")
+        return
+
     states[uid] = {"kind": "question"}
-    bot.send_message(c.message.chat.id,
-        "💬 Напиши свой вопрос:", reply_markup=cancel_kb())
+    bot.send_message(
+        call.message.chat.id,
+        "💬 Напиши свой вопрос одним сообщением:",
+        reply_markup=cancel_kb()
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data == "cancel")
-def cb_cancel(c):
-    states.pop(c.from_user.id, None)
-    bot.answer_callback_query(c.id, "Отменено")
-    bot.send_message(c.message.chat.id, "Главное меню:", reply_markup=main_kb())
+def cb_cancel(call):
+    states.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "Отменено")
+    bot.send_message(
+        call.message.chat.id,
+        "Главное меню:",
+        reply_markup=main_kb()
+    )
 
-# ============ ФОТО ============
+
+# =========================================================
+# PHOTO COLLECTION
+# =========================================================
 @bot.message_handler(content_types=["photo"])
-def h_photo(m):
-    uid = m.from_user.id
-    st = states.get(uid)
-    if not st or st.get("kind") != "payout" or st.get("step") != 2:
-        return bot.send_message(m.chat.id, "Сейчас фото не нужно.")
-    photo_id = m.photo[-1].file_id
-    st["data"]["photos"].append(photo_id)
-    count = len(st["data"]["photos"])
-    if count > MAX_PHOTOS:
-        return bot.send_message(m.chat.id,
-            f"📸 У тебя уже больше {MAX_PHOTOS} скриншотов.\n\n"
-            f"Такие объёмы разбираем вручную — напиши в ЛС {NEGOTIATOR}, "
-            f"скинь все скрины туда, и мы всё оформим.",
-            parse_mode="Markdown", reply_markup=photos_done_kb())
-    if count == MAX_PHOTOS:
-        return bot.send_message(m.chat.id,
-            f"📸 Фото {count}/{MAX_PHOTOS} — достигнут лимит.\n"
-            f"Нажми «Отправить заявку» или, если скринов больше, "
-            f"напиши в ЛС {NEGOTIATOR}.",
-            parse_mode="Markdown", reply_markup=photos_done_kb())
-    bot.send_message(m.chat.id,
+def h_photo(message):
+    uid = message.from_user.id
+    state = states.get(uid)
+
+    if not state or state.get("kind") != "payout" or state.get("step") != 2:
+        bot.send_message(message.chat.id, "Сейчас фотографии не запрашиваются.")
+        return
+
+    photos = state["data"]["photos"]
+
+    if len(photos) >= MAX_PHOTOS:
+        bot.send_message(
+            message.chat.id,
+            f"Достигнут лимит — {MAX_PHOTOS} фотографий. "
+            "Нажми «Отправить заявку».",
+            reply_markup=photos_done_kb()
+        )
+        return
+
+    photos.append(message.photo[-1].file_id)
+    count = len(photos)
+
+    bot.send_message(
+        message.chat.id,
         f"📸 Фото {count}/{MAX_PHOTOS} принято.\n"
-        f"Пришли ещё или нажми «Отправить заявку».",
-        reply_markup=photos_done_kb())
+        "Можешь отправить ещё или нажать «Отправить заявку».",
+        reply_markup=photos_done_kb()
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data == "photos_done")
-def cb_photos_done(c):
-    uid = c.from_user.id
-    st = states.get(uid)
-    if not st or st.get("kind") != "payout" or st.get("step") != 2:
-        return bot.answer_callback_query(c.id, "Не в анкете", show_alert=True)
-    if not st["data"]["photos"]:
-        return bot.answer_callback_query(c.id, "Пришли хотя бы одно фото", show_alert=True)
-    bot.answer_callback_query(c.id, "Отправляю...")
-    finish_payout(c.message, st)
+def cb_photos_done(call):
+    uid = call.from_user.id
+    state = states.get(uid)
 
-# ============ ЕДИНЫЙ ТЕКСТ ============
+    if not state or state.get("kind") != "payout" or state.get("step") != 2:
+        bot.answer_callback_query(
+            call.id,
+            "Сейчас ты не заполняешь заявку.",
+            show_alert=True
+        )
+        return
+
+    if not state["data"]["photos"]:
+        bot.answer_callback_query(
+            call.id,
+            "Сначала отправь хотя бы один скриншот.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(call.id, "Отправляю заявку...")
+    finish_payout(call.message, state, call.from_user)
+
+
+def finish_payout(message, state, user):
+    uid = user.id
+    data = state["data"]
+    now = int(time.time())
+    code = gen_code("P")
+    photos = ",".join(data["photos"])
+
+    x(
+        "INSERT INTO payouts"
+        "(code,user_id,chat_id,username,target,ads_count,reward,photos,created) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            code,
+            uid,
+            message.chat.id,
+            user.username or "",
+            data["target"],
+            data["ads_count"],
+            data["reward"],
+            photos,
+            now
+        )
+    )
+
+    states.pop(uid, None)
+    cooldown[uid] = now
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Заявка {code} успешно отправлена на модерацию!\n\n"
+        f"📢 Аккаунт/канал: {data['target']}\n"
+        f"📊 Количество реклам: {data['ads_count']}\n"
+        f"🎁 Предварительная награда: {data['reward']}\n"
+        f"📸 Скриншотов: {len(data['photos'])}\n\n"
+        "⏳ Администратор проверит заявку. Обычно это занимает "
+        "до 24 часов.\n"
+        "📩 Результат проверки придёт в этот чат.\n\n"
+        f"Чтобы проверить статус позже, используй:\n/status {code}",
+        reply_markup=main_kb()
+    )
+
+    if notify_on():
+        payout = q(
+            "SELECT * FROM payouts WHERE code=?",
+            (code,),
+            one=True
+        )
+        try:
+            send_admin_payout(ADMIN_ID, payout)
+        except Exception as exc:
+            print("[ADMIN PAYOUT NOTIFICATION ERROR]", exc)
+
+
+# =========================================================
+# TEXT HANDLER: QUESTIONS, PAYOUT STEPS, ADMIN REPLIES/BC
+# =========================================================
 @bot.message_handler(content_types=["text"])
-def h_all_text(m):
-    uid = m.from_user.id
-    txt = (m.text or "").strip()
-    if txt.startswith("/"): return
+def h_all_text(message):
+    uid = message.from_user.id
+    text_value = (message.text or "").strip()
 
-    # --- АДМИН ---
-    if uid == ADMIN_ID and ADMIN_ID in states:
-        st = states.get(ADMIN_ID, {})
-        kind = st.get("kind")
-        if kind == "reply_payout":
-            code = st["code"]; del states[ADMIN_ID]
-            t = q("SELECT * FROM payouts WHERE code=?", (code,), one=True)
-            if not t: return bot.reply_to(m, "❌ Заявка не найдена")
-            try:
-                bot.send_message(t["chat_id"], f"💬 Ответ по заявке {code}:\n\n{txt}")
-                bot.reply_to(m, "✅ Отправлено")
-            except Exception as e:
-                bot.reply_to(m, f"❌ Ошибка: {e}")
-            return
+    if not text_value or text_value.startswith("/"):
+        return
+
+    # Admin text modes
+    if is_admin(uid) and uid in states:
+        state = states.get(uid, {})
+        kind = state.get("kind")
+
         if kind == "reply_question":
-            code = st["code"]; del states[ADMIN_ID]
-            r = q("SELECT * FROM questions WHERE code=?", (code,), one=True)
-            if not r: return bot.reply_to(m, "❌ Вопрос не найден")
-            try:
-                bot.send_message(r["chat_id"], f"💬 Ответ на вопрос {code}:\n\n{txt}")
-                x("UPDATE questions SET answer=?, status='answered' WHERE code=?", (txt, code))
-                bot.reply_to(m, "✅ Отправлено")
-            except Exception as e:
-                bot.reply_to(m, f"❌ Ошибка: {e}")
-            return
-        if kind == "bc":
-            del states[ADMIN_ID]
-            uids = set()
-            for r in q("SELECT DISTINCT chat_id FROM payouts"): uids.add(r["chat_id"])
-            for r in q("SELECT DISTINCT chat_id FROM questions"): uids.add(r["chat_id"])
-            ok = 0
-            for cid in uids:
-                try: bot.send_message(cid, f"📢 {txt}"); ok += 1; time.sleep(0.05)
-                except Exception: pass
-            return bot.reply_to(m, f"📢 {ok}/{len(uids)}")
-        del states[ADMIN_ID]
-        return bot.send_message(m.chat.id, "Режим сброшен.", reply_markup=admin_menu_kb())
+            code = state["code"]
+            states.pop(uid, None)
+            row = q(
+                "SELECT * FROM questions WHERE code=?",
+                (code,),
+                one=True
+            )
+            if not row:
+                bot.reply_to(message, "❌ Вопрос не найден.")
+                return
 
-    # --- ПОЛЬЗОВАТЕЛЬ ---
-    if uid in states:
-        st = states[uid]
-        if st.get("kind") == "question":
-            now = int(time.time()); code = f"Q-{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
-            x("INSERT INTO questions(code,user_id,chat_id,username,text,created) VALUES(?,?,?,?,?,?)",
-              (code, uid, m.chat.id, m.from_user.username or "", txt, now))
-            del states[uid]
-            bot.send_message(m.chat.id, f"✅ Вопрос {code} отправлен.", reply_markup=main_kb())
-            r = q("SELECT * FROM questions WHERE code=?", (code,), one=True)
-            try:
-                if notify_on():
-                    bot.send_message(ADMIN_ID, fmt_question(r), parse_mode="Markdown",
-                                     reply_markup=question_card_kb(code))
-            except Exception as e: print("[NOTIFY Q]", e)
+            delivered = safe_notify_user(
+                row["chat_id"],
+                f"💬 Ответ администрации на вопрос {code}:\n\n{text_value}"
+            )
+            if delivered:
+                x(
+                    "UPDATE questions SET answer=?,status='answered' WHERE code=?",
+                    (text_value, code)
+                )
+                bot.reply_to(message, "✅ Ответ отправлен пользователю.")
+            else:
+                bot.reply_to(message, "⚠️ Не удалось отправить ответ пользователю.")
             return
-        if st.get("kind") == "payout":
-            step = st["step"]
+
+        if kind == "bc":
+            states.pop(uid, None)
+            recipients = set()
+            for row in q("SELECT DISTINCT chat_id FROM payouts"):
+                recipients.add(row["chat_id"])
+            for row in q("SELECT DISTINCT chat_id FROM questions"):
+                recipients.add(row["chat_id"])
+
+            sent = 0
+            failed = 0
+            for chat_id in recipients:
+                try:
+                    bot.send_message(chat_id, f"📢 Сообщение от администрации:\n\n{text_value}")
+                    sent += 1
+                    time.sleep(0.05)
+                except Exception:
+                    failed += 1
+
+            bot.reply_to(
+                message,
+                f"📢 Рассылка завершена.\nДоставлено: {sent}\nНе доставлено: {failed}"
+            )
+            return
+
+        states.pop(uid, None)
+        bot.send_message(
+            message.chat.id,
+            "Режим ввода сброшен.",
+            reply_markup=admin_menu_kb()
+        )
+        return
+
+    # User flow
+    if uid in states:
+        state = states[uid]
+
+        if state.get("kind") == "question":
+            code = gen_code("Q")
+            now = int(time.time())
+            x(
+                "INSERT INTO questions"
+                "(code,user_id,chat_id,username,text,created) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    code,
+                    uid,
+                    message.chat.id,
+                    message.from_user.username or "",
+                    text_value,
+                    now
+                )
+            )
+            states.pop(uid, None)
+
+            bot.send_message(
+                message.chat.id,
+                f"✅ Вопрос {code} отправлен администрации.\n"
+                "Ответ придёт сюда же.",
+                reply_markup=main_kb()
+            )
+
+            if notify_on():
+                row = q(
+                    "SELECT * FROM questions WHERE code=?",
+                    (code,),
+                    one=True
+                )
+                try:
+                    bot.send_message(
+                        ADMIN_ID,
+                        fmt_question(row),
+                        reply_markup=question_card_kb(code)
+                    )
+                except Exception as exc:
+                    print("[QUESTION NOTIFICATION ERROR]", exc)
+            return
+
+        if state.get("kind") == "payout":
+            step = state["step"]
+
             if step == 0:
-                if "@" not in txt:
-                    return bot.send_message(m.chat.id, "⚠️ Нужен `@username`.", parse_mode="Markdown")
-                target = "@" + txt.split("@", 1)[1].split()[0].strip()
-                st["data"]["target"] = target
-                st["step"] = 1
-                return bot.send_message(m.chat.id,
-                    "2️⃣ Сколько реклам ты сделал? Напиши число (например `7`):",
-                    reply_markup=cancel_kb())
+                value = text_value.strip()
+                if not value.startswith("@") or len(value) < 3:
+                    bot.send_message(
+                        message.chat.id,
+                        "⚠️ Введи username в формате @username.",
+                        reply_markup=cancel_kb()
+                    )
+                    return
+
+                username = value.split()[0]
+                if not all(ch.isalnum() or ch == "_" for ch in username[1:]):
+                    bot.send_message(
+                        message.chat.id,
+                        "⚠️ В username допустимы только латинские буквы, "
+                        "цифры и символ подчёркивания.",
+                        reply_markup=cancel_kb()
+                    )
+                    return
+
+                state["data"]["target"] = username
+                state["step"] = 1
+                bot.send_message(
+                    message.chat.id,
+                    "2️⃣ Сколько реклам ты разместил? Напиши целое число:",
+                    reply_markup=cancel_kb()
+                )
+                return
+
             if step == 1:
                 try:
-                    ads = int(txt.strip())
-                    if ads < 0: raise ValueError
+                    ads = int(text_value)
+                    if ads < 1 or ads > 100000:
+                        raise ValueError
                 except ValueError:
-                    return bot.send_message(m.chat.id, "⚠️ Напиши число, например `7`.")
-                st["data"]["ads_count"] = ads
-                st["data"]["reward"] = calc_reward(ads)
-                st["step"] = 2
-                return bot.send_message(m.chat.id,
-                    f"🎁 Твоя награда: *{st['data']['reward']}*\n\n"
-                    f"3️⃣ Пришли скриншоты рекламы (до {MAX_PHOTOS} шт).\n"
-                    f"Можно по одному. Когда закончишь — нажми «Отправить заявку».",
-                    parse_mode="Markdown", reply_markup=photos_done_kb())
+                    bot.send_message(
+                        message.chat.id,
+                        "⚠️ Введи целое число от 1 до 100000.",
+                        reply_markup=cancel_kb()
+                    )
+                    return
 
-    if uid != ADMIN_ID:
-        if is_banned(uid): return bot.send_message(m.chat.id, "🚫 Забанен.")
-        return bot.send_message(m.chat.id, "Выбери действие:", reply_markup=main_kb())
-    bot.send_message(m.chat.id, "Админ-меню:", reply_markup=admin_menu_kb())
+                state["data"]["ads_count"] = ads
+                state["data"]["reward"] = calc_reward(ads)
+                state["step"] = 2
 
-def finish_payout(m, st):
-    uid = m.from_user.id
-    d = st["data"]
-    now = int(time.time()); code = gen_code()
-    photos = ",".join(d["photos"])
-    x("INSERT INTO payouts(code,user_id,chat_id,username,target,ads_count,reward,photos,created) VALUES(?,?,?,?,?,?,?,?,?)",
-      (code, uid, m.chat.id, m.from_user.username or "", d["target"],
-       d["ads_count"], d["reward"], photos, now))
-    del states[uid]; cooldown[uid] = now
-    bot.send_message(m.chat.id,
-        f"✅ Заявка *{code}* отправлена на модерацию!\n\n"
-        f"📢 Канал: {d['target']}\n"
-        f"📊 Реклам: {d['ads_count']}\n"
-        f"🎁 Награда: {d['reward']}\n\n"
-        f"⏳ Автоответ: администратор рассмотрит заявку до 24 часов.\n"
-        f"Ответ придёт сюда же.\n\n"
-        f"📋 Следи за статусом: `/status {code}`",
-        parse_mode="Markdown", reply_markup=main_kb())
-    if notify_on():
-        t = q("SELECT * FROM payouts WHERE code=?", (code,), one=True)
-        try:
-            if d["photos"]:
-                bot.send_photo(ADMIN_ID, d["photos"][0], caption=fmt_payout(t),
-                               parse_mode="Markdown", reply_markup=payout_card_kb(code, m.from_user.username))
-                for extra in d["photos"][1:]:
-                    bot.send_photo(ADMIN_ID, extra)
-            else:
-                bot.send_message(ADMIN_ID, fmt_payout(t), parse_mode="Markdown",
-                                 reply_markup=payout_card_kb(code, m.from_user.username))
-        except Exception as e:
-            print("[NOTIFY P]", e)
+                bot.send_message(
+                    message.chat.id,
+                    f"🎁 Предварительная награда: {state['data']['reward']}\n\n"
+                    f"3️⃣ Отправь скриншоты подтверждения (до {MAX_PHOTOS} шт.).\n"
+                    "Можно отправлять по одному. Когда закончишь, "
+                    "нажми «Отправить заявку».",
+                    reply_markup=photos_done_kb()
+                )
+                return
 
-# ============ МОИ ЗАЯВКИ ============
+    if is_banned(uid):
+        bot.send_message(message.chat.id, "🚫 Доступ к боту ограничен.")
+        return
+
+    if is_admin(uid):
+        bot.send_message(
+            message.chat.id,
+            "🛠 Админ-панель:",
+            reply_markup=admin_menu_kb()
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            "Выбери действие:",
+            reply_markup=main_kb()
+        )
+
+
+# =========================================================
+# USER: MY PAYOUTS / QUESTIONS
+# =========================================================
 @bot.callback_query_handler(func=lambda c: c.data == "my:payouts")
-def cb_my_payouts(c):
-    bot.answer_callback_query(c.id)
-    rows = q("SELECT * FROM payouts WHERE user_id=? AND hidden=0 AND status != 'closed' ORDER BY id DESC LIMIT 20",
-             (c.from_user.id,))
-    if not rows: return bot.send_message(c.message.chat.id, "Заявок нет.")
-    bot.send_message(c.message.chat.id, "📋 Твои заявки:",
-                     reply_markup=user_my_list_kb(rows))
+def cb_my_payouts(call):
+    bot.answer_callback_query(call.id)
+    rows = q(
+        "SELECT * FROM payouts "
+        "WHERE user_id=? AND hidden=0 AND status!='closed' "
+        "ORDER BY id DESC LIMIT 20",
+        (call.from_user.id,)
+    )
+    if not rows:
+        bot.send_message(call.message.chat.id, "📋 У тебя пока нет открытых заявок.")
+        return
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for row in rows:
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{row['code']} — {STATUS.get(row['status'], row['status'])}",
+                callback_data=f"upv:{row['code']}"
+            )
+        )
+    kb.add(types.InlineKeyboardButton("⬅️ Главное меню", callback_data="home"))
+    bot.send_message(
+        call.message.chat.id,
+        "📋 Твои заявки:",
+        reply_markup=kb
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "home")
+def cb_home(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "Главное меню:",
+        reply_markup=main_kb()
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("upv:"))
-def cb_user_view_payout(c):
-    code = c.data.split(":")[1]
-    t = q("SELECT * FROM payouts WHERE code=? AND user_id=?", (code, c.from_user.id), one=True)
-    if not t: return bot.answer_callback_query(c.id, "Не найдена", show_alert=True)
-    if t["status"] == "closed":
-        return bot.answer_callback_query(c.id, "🔒 Заявка закрыта", show_alert=True)
-    bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, fmt_user_payout(t), parse_mode="Markdown",
-                     reply_markup=user_payout_kb(code))
+def cb_user_view_payout(call):
+    code = call.data.split(":", 1)[1]
+    payout = q(
+        "SELECT * FROM payouts WHERE code=? AND user_id=?",
+        (code, call.from_user.id),
+        one=True
+    )
+    if not payout:
+        bot.answer_callback_query(call.id, "Заявка не найдена.", show_alert=True)
+        return
+
+    if payout["status"] == "closed":
+        bot.answer_callback_query(call.id, "Заявка закрыта.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        fmt_user_payout(payout),
+        reply_markup=user_payout_kb(code)
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("upc:"))
-def cb_user_close_payout(c):
-    code = c.data.split(":")[1]
-    t = q("SELECT * FROM payouts WHERE code=? AND user_id=?", (code, c.from_user.id), one=True)
-    if not t: return bot.answer_callback_query(c.id, "Не найдена", show_alert=True)
-    if t["status"] == "closed":
-        return bot.answer_callback_query(c.id, "Уже закрыта", show_alert=True)
+def cb_user_close_payout(call):
+    code = call.data.split(":", 1)[1]
+    payout = q(
+        "SELECT * FROM payouts WHERE code=? AND user_id=?",
+        (code, call.from_user.id),
+        one=True
+    )
+    if not payout:
+        bot.answer_callback_query(call.id, "Заявка не найдена.", show_alert=True)
+        return
+
+    if payout["status"] in ("closed", "paid", "rejected"):
+        bot.answer_callback_query(call.id, "Эту заявку нельзя закрыть.", show_alert=True)
+        return
+
     x("UPDATE payouts SET status='closed' WHERE code=?", (code,))
-    bot.answer_callback_query(c.id, "Закрыто")
-    bot.send_message(c.message.chat.id, f"🔒 Заявка *{code}* закрыта.",
-                     parse_mode="Markdown")
+    bot.answer_callback_query(call.id, "Заявка закрыта.")
+    bot.send_message(
+        call.message.chat.id,
+        f"🔒 Заявка {code} закрыта."
+    )
     try:
-        bot.send_message(ADMIN_ID, f"🔒 @{t['username'] or '—'} закрыл заявку {code}")
-    except Exception: pass
+        bot.send_message(
+            ADMIN_ID,
+            f"🔒 Пользователь @{payout['username'] or '—'} закрыл заявку {code}."
+        )
+    except Exception as exc:
+        print("[ADMIN CLOSE NOTICE ERROR]", exc)
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("uph:"))
-def cb_user_hide_payout(c):
-    code = c.data.split(":")[1]
-    t = q("SELECT * FROM payouts WHERE code=? AND user_id=?", (code, c.from_user.id), one=True)
-    if not t: return bot.answer_callback_query(c.id, "Не найдена", show_alert=True)
-    x("UPDATE payouts SET hidden=1 WHERE code=?", (code,))
-    bot.answer_callback_query(c.id, "Убрано")
-    bot.send_message(c.message.chat.id, f"👁 Заявка {code} убрана.")
+def cb_user_hide_payout(call):
+    code = call.data.split(":", 1)[1]
+    payout = q(
+        "SELECT * FROM payouts WHERE code=? AND user_id=?",
+        (code, call.from_user.id),
+        one=True
+    )
+    if not payout:
+        bot.answer_callback_query(call.id, "Заявка не найдена.", show_alert=True)
+        return
+
+    x(
+        "UPDATE payouts SET hidden=1 WHERE code=? AND user_id=?",
+        (code, call.from_user.id)
+    )
+    bot.answer_callback_query(call.id, "Убрано из списка.")
+    bot.send_message(call.message.chat.id, f"👁 Заявка {code} убрана из списка.")
+
 
 @bot.callback_query_handler(func=lambda c: c.data == "my:questions")
-def cb_my_questions(c):
-    bot.answer_callback_query(c.id)
-    rows = q("SELECT * FROM questions WHERE user_id=? AND hidden=0 ORDER BY id DESC LIMIT 20",
-             (c.from_user.id,))
-    if not rows: return bot.send_message(c.message.chat.id, "Вопросов нет.")
-    bot.send_message(c.message.chat.id, "📨 Твои вопросы:\n" + "\n".join(
-        f"{r['code']} {QSTATUS.get(r['status'])} — {r['text'][:40]}" for r in rows))
+def cb_my_questions(call):
+    bot.answer_callback_query(call.id)
+    rows = q(
+        "SELECT * FROM questions "
+        "WHERE user_id=? AND hidden=0 "
+        "ORDER BY id DESC LIMIT 20",
+        (call.from_user.id,)
+    )
+    if not rows:
+        bot.send_message(call.message.chat.id, "📨 У тебя пока нет вопросов.")
+        return
 
-# ============ АДМИН-МЕНЮ ============
+    lines = [
+        f"{row['code']} — {QSTATUS.get(row['status'], row['status'])}\n"
+        f"{row['text'][:100]}"
+        for row in rows
+    ]
+    bot.send_message(call.message.chat.id, "📨 Твои вопросы:\n\n" + "\n\n".join(lines))
+
+
+# =========================================================
+# ADMIN MENU
+# =========================================================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("adm:"))
-def cb_admin_menu(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    bot.answer_callback_query(c.id)
-    k = c.data.split(":")[1]
+def cb_admin_menu(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
 
-    if k == "menu":
-        return bot.send_message(c.message.chat.id, "🛠 Меню:", reply_markup=admin_menu_kb())
-    if k == "open":
-        rows = q("SELECT * FROM payouts WHERE status != 'closed' ORDER BY id DESC LIMIT 30")
-        if not rows: return bot.send_message(c.message.chat.id, "Открытых нет.")
-        return bot.send_message(c.message.chat.id, "📂 Открытые:",
-                                reply_markup=payout_list_kb(rows))
-    if k == "closed":
-        rows = q("SELECT * FROM payouts WHERE status = 'closed' ORDER BY id DESC LIMIT 30")
-        if not rows: return bot.send_message(c.message.chat.id, "Закрытых нет.")
-        return bot.send_message(c.message.chat.id, "🔒 Закрытые:",
-                                reply_markup=closed_list_kb(rows))
-    if k == "all":
-        rows = q("SELECT * FROM payouts ORDER BY id DESC LIMIT 30")
-        if not rows: return bot.send_message(c.message.chat.id, "Заявок нет.")
-        return bot.send_message(c.message.chat.id, "📋 Все заявки:",
-                                reply_markup=payout_list_kb(rows))
-    if k == "questions":
-        rows = q("SELECT * FROM questions ORDER BY id DESC LIMIT 30")
-        if not rows: return bot.send_message(c.message.chat.id, "Вопросов нет.")
-        return bot.send_message(c.message.chat.id, "💬 Вопросы:",
-                                reply_markup=question_list_kb(rows))
-    if k == "stats":
-        tot = q("SELECT COUNT(*) c FROM payouts", one=True)["c"]
-        new = q("SELECT COUNT(*) c FROM payouts WHERE status='new'", one=True)["c"]
-        paid = q("SELECT COUNT(*) c FROM payouts WHERE status='paid'", one=True)["c"]
-        rej = q("SELECT COUNT(*) c FROM payouts WHERE status='rejected'", one=True)["c"]
-        clo = q("SELECT COUNT(*) c FROM payouts WHERE status='closed'", one=True)["c"]
-        qs = q("SELECT COUNT(*) c FROM questions", one=True)["c"]
-        return bot.send_message(c.message.chat.id,
-            f"📊 *Статистика*\n\n"
-            f"💰 Заявки: {tot} (🆕 {new} | ✅ {paid} | ❌ {rej} | 🔒 {clo})\n"
-            f"💬 Вопросы: {qs}", parse_mode="Markdown")
-    if k == "bans":
-        rows = q("SELECT * FROM banned")
-        if not rows: return bot.send_message(c.message.chat.id, "Пусто.")
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        for r in rows:
-            kb.add(types.InlineKeyboardButton(f"Разбан {r['user_id']}",
-                callback_data=f"ub:{r['user_id']}"))
-        return bot.send_message(c.message.chat.id, "🚫 Баны:", reply_markup=kb)
-    if k == "notify":
-        new_val = "0" if notify_on() else "1"
-        x("UPDATE settings SET value=? WHERE key='notify'", (new_val,))
-        return bot.send_message(c.message.chat.id,
-            "🔔 Уведомления включены." if new_val == "1" else "🔕 Уведомления выключены.",
-            reply_markup=admin_menu_kb())
-    if k == "bc":
-        states[ADMIN_ID] = {"kind": "bc"}
-        return bot.send_message(c.message.chat.id, "📢 Текст рассылки (или /cancel):")
-    if k == "csv":
-        path = f"payouts_{int(time.time())}.csv"
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["code","user","username","target","ads","reward","status","created"])
-            for r in q("SELECT * FROM payouts ORDER BY id"):
-                w.writerow([r["code"], r["user_id"], r["username"], r["target"],
-                            r["ads_count"], r["reward"], r["status"],
-                            time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created"]))])
-        with open(path, "rb") as f:
-            bot.send_document(c.message.chat.id, f)
+    bot.answer_callback_query(call.id)
+    action = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
 
-# ============ ОТКРЫТИЕ / ДЕЙСТВИЯ ============
-@bot.callback_query_handler(func=lambda c: c.data.startswith("pv:"))
-def cb_open_payout(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    code = c.data.split(":")[1]
-    t = q("SELECT * FROM payouts WHERE code=?", (code,), one=True)
-    if not t: return bot.answer_callback_query(c.id, f"Заявка {code} не в базе", show_alert=True)
-    is_closed = (t["status"] == "closed")
-    bot.answer_callback_query(c.id, f"Заявка {code}")
-    photos = t["photos"].split(",") if t["photos"] else []
-    if photos:
-        try:
-            bot.send_photo(c.message.chat.id, photos[0], caption=fmt_payout(t),
-                           parse_mode="Markdown",
-                           reply_markup=payout_card_kb(code, t["username"], is_closed))
-            for extra in photos[1:]:
-                bot.send_photo(c.message.chat.id, extra)
+    if action == "menu":
+        bot.send_message(chat_id, "🛠 Админ-панель:", reply_markup=admin_menu_kb())
+        return
+
+    if action == "open":
+        rows = q(
+            "SELECT * FROM payouts WHERE status NOT IN ('closed','paid','rejected') "
+            "ORDER BY id DESC LIMIT 50"
+        )
+        if not rows:
+            bot.send_message(chat_id, "📂 Открытых заявок нет.")
             return
-        except Exception: pass
-    bot.send_message(c.message.chat.id, fmt_payout(t), parse_mode="Markdown",
-                     reply_markup=payout_card_kb(code, t["username"], is_closed))
+        bot.send_message(
+            chat_id,
+            "📂 Открытые заявки:",
+            reply_markup=payout_list_kb(rows, "adm:menu")
+        )
+        return
+
+    if action == "closed":
+        rows = q(
+            "SELECT * FROM payouts WHERE status='closed' "
+            "ORDER BY id DESC LIMIT 50"
+        )
+        if not rows:
+            bot.send_message(chat_id, "🔒 Закрытых заявок нет.")
+            return
+        bot.send_message(
+            chat_id,
+            "🔒 Закрытые заявки:",
+            reply_markup=payout_list_kb(rows, "adm:menu")
+        )
+        return
+
+    if action == "all":
+        rows = q("SELECT * FROM payouts ORDER BY id DESC LIMIT 50")
+        if not rows:
+            bot.send_message(chat_id, "Заявок пока нет.")
+            return
+        bot.send_message(
+            chat_id,
+            "📋 Последние заявки:",
+            reply_markup=payout_list_kb(rows, "adm:menu")
+        )
+        return
+
+    if action == "questions":
+        rows = q("SELECT * FROM questions ORDER BY id DESC LIMIT 50")
+        if not rows:
+            bot.send_message(chat_id, "💬 Вопросов пока нет.")
+            return
+        bot.send_message(
+            chat_id,
+            "💬 Вопросы пользователей:",
+            reply_markup=question_list_kb(rows)
+        )
+        return
+
+    if action == "stats":
+        total = q("SELECT COUNT(*) AS c FROM payouts", one=True)["c"]
+        new = q("SELECT COUNT(*) AS c FROM payouts WHERE status='new'", one=True)["c"]
+        paid = q("SELECT COUNT(*) AS c FROM payouts WHERE status='paid'", one=True)["c"]
+        rejected = q("SELECT COUNT(*) AS c FROM payouts WHERE status='rejected'", one=True)["c"]
+        closed = q("SELECT COUNT(*) AS c FROM payouts WHERE status='closed'", one=True)["c"]
+        questions = q("SELECT COUNT(*) AS c FROM questions", one=True)["c"]
+
+        bot.send_message(
+            chat_id,
+            "📊 Статистика\n\n"
+            f"💰 Всего заявок: {total}\n"
+            f"🆕 Новых: {new}\n"
+            f"✅ Одобрено: {paid}\n"
+            f"❌ Отклонено: {rejected}\n"
+            f"🔒 Закрыто: {closed}\n"
+            f"💬 Вопросов: {questions}"
+        )
+        return
+
+    if action == "bans":
+        rows = q("SELECT * FROM banned ORDER BY ts DESC LIMIT 50")
+        if not rows:
+            bot.send_message(chat_id, "🚫 Список блокировок пуст.")
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for row in rows:
+            kb.add(
+                types.InlineKeyboardButton(
+                    f"Разблокировать {row['user_id']}",
+                    callback_data=f"ub:{row['user_id']}"
+                )
+            )
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
+        bot.send_message(chat_id, "🚫 Заблокированные пользователи:", reply_markup=kb)
+        return
+
+    if action == "notify":
+        new_value = "0" if notify_on() else "1"
+        x(
+            "INSERT INTO settings(key,value) VALUES('notify',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (new_value,)
+        )
+        bot.send_message(
+            chat_id,
+            "🔔 Уведомления включены." if new_value == "1"
+            else "🔕 Уведомления выключены.",
+            reply_markup=admin_menu_kb()
+        )
+        return
+
+    if action == "bc":
+        states[ADMIN_ID] = {"kind": "bc"}
+        bot.send_message(
+            chat_id,
+            "📢 Отправь текст рассылки одним сообщением.\n"
+            "Для отмены используй /cancel."
+        )
+        return
+
+    if action == "csv":
+        path = f"payouts_{int(time.time())}.csv"
+        with open(path, "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                "code", "user_id", "username", "target",
+                "ads_count", "reward", "status", "created"
+            ])
+            for row in q("SELECT * FROM payouts ORDER BY id"):
+                writer.writerow([
+                    row["code"],
+                    row["user_id"],
+                    row["username"],
+                    row["target"],
+                    row["ads_count"],
+                    row["reward"],
+                    row["status"],
+                    time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.localtime(row["created"] or 0)
+                    )
+                ])
+        with open(path, "rb") as file:
+            bot.send_document(chat_id, file, caption="📤 Экспорт заявок CSV")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+
+
+# =========================================================
+# ADMIN: OPEN PAYOUT / APPROVE / REJECT / REOPEN / DELETE
+# =========================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pv:"))
+def cb_open_payout(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    code = call.data.split(":", 1)[1]
+    payout = q(
+        "SELECT * FROM payouts WHERE code=?",
+        (code,),
+        one=True
+    )
+    if not payout:
+        bot.answer_callback_query(call.id, "Заявка не найдена.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "Открываю заявку...")
+    send_admin_payout(call.message.chat.id, payout)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("pa:", "pd:")))
+def cb_payout_decision(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    action, code = call.data.split(":", 1)
+    payout = q(
+        "SELECT * FROM payouts WHERE code=?",
+        (code,),
+        one=True
+    )
+
+    if not payout:
+        bot.answer_callback_query(call.id, "Заявка не найдена.", show_alert=True)
+        return
+
+    if payout["status"] == "closed":
+        bot.answer_callback_query(call.id, "Заявка закрыта.", show_alert=True)
+        return
+
+    if payout["status"] in ("paid", "rejected"):
+        bot.answer_callback_query(call.id, "Заявка уже обработана.", show_alert=True)
+        return
+
+    if action == "pa":
+        x("UPDATE payouts SET status='paid' WHERE code=?", (code,))
+        user_text = (
+            f"🎉 Ваша заявка {code} на выплату за рекламу ТГК одобрена!\n\n"
+            f"⭐️ На ваш аккаунт в Mechagram {payout['target']} "
+            f"скоро будет зачислено: {payout['reward']}!\n\n"
+            "Спасибо за контент и продвижение ТГК Zellen! ❤️"
+        )
+        admin_text = (
+            f"✅ Заявка {code} принята.\n"
+            f"👤 Пользователь: @{payout['username'] or '—'}\n"
+            f"🎁 Награда: {payout['reward']}"
+        )
+    else:
+        x("UPDATE payouts SET status='rejected' WHERE code=?", (code,))
+        user_text = (
+            f"❌ Ваша заявка {code} на выплату за рекламу ТГК "
+            "была отклонена администрацией.\n\n"
+            "Возможные причины:\n"
+            "• Неполные или нечитаемые скриншоты.\n"
+            "• Несоответствие количества реклам.\n"
+            "• Недостоверные подтверждения.\n"
+            "• Нарушение правил размещения рекламы.\n\n"
+            "Если считаете, что произошла ошибка, "
+            "обратитесь к администрации."
+        )
+        admin_text = f"❌ Заявка {code} отклонена."
+
+    bot.answer_callback_query(call.id, "Решение сохранено.")
+    if not safe_notify_user(payout["chat_id"], user_text):
+        admin_text += "\n⚠️ Не удалось доставить сообщение пользователю."
+
+    bot.send_message(
+        call.message.chat.id,
+        admin_text,
+        reply_markup=admin_menu_kb()
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("rc:"))
-def cb_reopen(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    code = c.data.split(":")[1]
-    t = q("SELECT * FROM payouts WHERE code=?", (code,), one=True)
-    if not t: return bot.answer_callback_query(c.id, "Не найдена", show_alert=True)
-    x("UPDATE payouts SET status='new', hidden=0 WHERE code=?", (code,))
-    bot.answer_callback_query(c.id, "Открыта заново")
-    bot.send_message(c.message.chat.id, f"🔓 Заявка {code} снова открыта (Новая).")
-    try:
-        bot.send_message(t["chat_id"], f"🔓 Твоя заявка {code} снова открыта.")
-    except Exception: pass
+def cb_reopen(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
 
-@bot.callback_query_handler(func=lambda c: c.data[:2] in ("pa","pd") and ":" in c.data)
-def cb_payout_decision(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    act, code = c.data.split(":")
-    t = q("SELECT * FROM payouts WHERE code=?", (code,), one=True)
-    if not t: return bot.answer_callback_query(c.id, f"Заявка {code} не в базе", show_alert=True)
-    if t["status"] == "closed":
-        return bot.answer_callback_query(c.id, "🔒 Заявка закрыта", show_alert=True)
-    bot.answer_callback_query(c.id)
+    code = call.data.split(":", 1)[1]
+    payout = q(
+        "SELECT * FROM payouts WHERE code=?",
+        (code,),
+        one=True
+    )
+    if not payout:
+        bot.answer_callback_query(call.id, "Заявка не найдена.", show_alert=True)
+        return
 
-    if act == "pa":
-        x("UPDATE payouts SET status='paid' WHERE code=?", (code,))
-        try:
-            bot.send_message(t["chat_id"],
-                f"🎉 Ваша заявка {code} на выплату за рекламу ТГК одобрена!\n\n"
-                f"⭐️ На ваш аккаунт в Mechagram {t['target']} скоро будет зачислено: {t['reward']}!\n\n"
-                f"Спасибо за контент и продвижение ТГК Zellen! ❤️",
-                parse_mode="Markdown")
-        except Exception: pass
-        bot.send_message(c.message.chat.id, f"✅ Заявка {code} принята. Награда: {t['reward']}")
-    elif act == "pd":
-        x("UPDATE payouts SET status='rejected' WHERE code=?", (code,))
-        try:
-            bot.send_message(t["chat_id"],
-                f"❌ Ваша заявка {code} на выплату за рекламу ТГК была отклонена администрацией.\n\n"
-                f"Возможные причины: неполные скриншоты, фотошоп, несоответствие количества реклам.\n\n"
-                f"Если считаешь, что произошла ошибка — напиши нам.",
-                parse_mode="Markdown")
-        except Exception: pass
-        bot.send_message(c.message.chat.id, f"❌ Заявка {code} отклонена.")
+    if payout["status"] != "closed":
+        bot.answer_callback_query(call.id, "Заявка не закрыта.", show_alert=True)
+        return
+
+    x(
+        "UPDATE payouts SET status='new',hidden=0 WHERE code=?",
+        (code,)
+    )
+    bot.answer_callback_query(call.id, "Заявка снова открыта.")
+    bot.send_message(
+        call.message.chat.id,
+        f"🔓 Заявка {code} снова открыта и возвращена в новые."
+    )
+    safe_notify_user(
+        payout["chat_id"],
+        f"🔓 Ваша заявка {code} снова открыта и ожидает проверки."
+    )
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("td:"))
-def cb_delete_payout(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    code = c.data.split(":")[1]
+def cb_delete_payout(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    code = call.data.split(":", 1)[1]
     x("DELETE FROM payouts WHERE code=?", (code,))
-    bot.answer_callback_query(c.id, "Удалено")
-    bot.send_message(c.message.chat.id, f"🗑 Заявка {code} удалена.")
+    bot.answer_callback_query(call.id, "Заявка удалена.")
+    bot.send_message(call.message.chat.id, f"🗑 Заявка {code} удалена из базы.")
 
-# ============ ВОПРОСЫ (админ) ============
+
+# =========================================================
+# ADMIN: QUESTIONS
+# =========================================================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("qv:"))
-def cb_open_question(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    code = c.data.split(":")[1]
-    r = q("SELECT * FROM questions WHERE code=?", (code,), one=True)
-    if not r: return bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
-    bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, fmt_question(r), parse_mode="Markdown",
-                     reply_markup=question_card_kb(code))
+def cb_open_question(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
 
-@bot.callback_query_handler(func=lambda c: c.data[:2] in ("qr","qc") and ":" in c.data)
-def cb_question_action(c):
-    if c.from_user.id != ADMIN_ID:
-        return bot.answer_callback_query(c.id, "Нет доступа", show_alert=True)
-    act, code = c.data.split(":")
-    r = q("SELECT * FROM questions WHERE code=?", (code,), one=True)
-    if not r: return bot.answer_callback_query(c.id, "Не найдено", show_alert=True)
-    bot.answer_callback_query(c.id)
-    if act == "qr":
-        states[ADMIN_ID] = {"kind": "reply_question", "code": code}
-        return bot.send_message(c.message.chat.id, f"✍️ Ответ на {code} (или /cancel):")
-    if act == "qc":
+    code = call.data.split(":", 1)[1]
+    row = q(
+        "SELECT * FROM questions WHERE code=?",
+        (code,),
+        one=True
+    )
+    if not row:
+        bot.answer_callback_query(call.id, "Вопрос не найден.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        fmt_question(row),
+        reply_markup=question_card_kb(code)
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("qr:", "qc:")))
+def cb_question_action(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    action, code = call.data.split(":", 1)
+    row = q(
+        "SELECT * FROM questions WHERE code=?",
+        (code,),
+        one=True
+    )
+    if not row:
+        bot.answer_callback_query(call.id, "Вопрос не найден.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if action == "qr":
+        states[ADMIN_ID] = {
+            "kind": "reply_question",
+            "code": code
+        }
+        bot.send_message(
+            call.message.chat.id,
+            f"✍️ Напиши ответ на вопрос {code}.\nДля отмены: /cancel"
+        )
+        return
+
+    if action == "qc":
         x("UPDATE questions SET status='closed' WHERE code=?", (code,))
-        return bot.send_message(c.message.chat.id, f"🔒 Вопрос {code} закрыт")
+        bot.send_message(
+            call.message.chat.id,
+            f"🔒 Вопрос {code} закрыт."
+        )
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ub:"))
-def cb_unban(c):
-    if c.from_user.id != ADMIN_ID: return
-    uid = int(c.data.split(":")[1])
-    x("DELETE FROM banned WHERE user_id=?", (uid,))
-    bot.answer_callback_query(c.id, "Разбанен")
-    try: bot.edit_message_text(f"✅ Разбан {uid}", c.message.chat.id, c.message.message_id)
-    except Exception: pass
+def cb_unban(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
 
-# ============ ЗАПУСК ============
+    try:
+        uid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        bot.answer_callback_query(call.id, "Некорректный ID.", show_alert=True)
+        return
+
+    x("DELETE FROM banned WHERE user_id=?", (uid,))
+    bot.answer_callback_query(call.id, "Пользователь разблокирован.")
+    bot.send_message(
+        call.message.chat.id,
+        f"✅ Пользователь {uid} разблокирован."
+    )
+
+
+# =========================================================
+# START
+# =========================================================
 if __name__ == "__main__":
-    print("Снимаю webhook...")
-    try: bot.delete_webhook(drop_pending_updates=False)
-    except Exception as e: print("⚠️ webhook:", e)
+    print("Starting bot...")
+    try:
+        bot.remove_webhook()
+    except Exception as exc:
+        print("Webhook warning:", exc)
 
     while True:
         try:
             me = bot.get_me()
-            print(f"✅ Запуск @{me.username}")
+            print(f"✅ Bot started: @{me.username}")
+            print(f"ADMIN_ID = {ADMIN_ID}")
+            payout_count = q(
+                "SELECT COUNT(*) AS c FROM payouts",
+                one=True
+            )["c"]
+            question_count = q(
+                "SELECT COUNT(*) AS c FROM questions",
+                one=True
+            )["c"]
+            print(
+                f"📊 Database: payouts={payout_count}, "
+                f"questions={question_count}"
+            )
             break
-        except Exception as e:
-            print(f"⏳ Сервер недоступен: {str(e)[:120]}")
-            print("   Жду 15 сек...")
-            time.sleep(15)
-
-    print(f"ADMIN_ID = {ADMIN_ID}")
-    cnt = q("SELECT COUNT(*) c FROM payouts", one=True)["c"]
-    qcnt = q("SELECT COUNT(*) c FROM questions", one=True)["c"]
-    print(f"📊 В базе: заявок={cnt}, вопросов={qcnt}")
+        except Exception as exc:
+            print(f"⚠️ Telegram API unavailable: {exc}")
+            time.sleep(10)
 
     while True:
         try:
-            bot.infinity_polling(allowed_updates=["message","callback_query"],
-                                 timeout=30, long_polling_timeout=30)
-        except Exception as e:
-            print(f"⚠️ Polling упал: {e}")
-            print("   Перезапуск через 10 сек...")
+            bot.infinity_polling(
+                allowed_updates=["message", "callback_query"],
+                timeout=30,
+                long_polling_timeout=30
+            )
+        except Exception as exc:
+            print(f"⚠️ Polling error: {exc}")
             time.sleep(10)
